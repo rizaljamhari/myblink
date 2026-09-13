@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import yaml
@@ -17,14 +19,63 @@ import yaml
 class BlinkRateLimitError(Exception):
     """Raised when Blink rate-limits an OAuth sign-in request."""
 
-    def __init__(self, retry_after: str | None = None) -> None:
+    def __init__(
+        self,
+        retry_after: str | None = None,
+        retry_at: str | None = None,
+        reset_source: str | None = None,
+    ) -> None:
         self.retry_after = retry_after
+        self.retry_at = retry_at
+        self.reset_source = reset_source
+
         message = "Blink login rate-limited (HTTP 429)"
-        if retry_after:
+        if retry_at:
+            message += f"; retry at {retry_at}"
+            if retry_after:
+                message += f" ({retry_after} seconds)"
+        elif retry_after:
             message += f"; retry after {retry_after} seconds"
         else:
-            message += "; wait before trying to sign in again"
+            message += "; Blink did not provide a reset time"
         super().__init__(message)
+
+
+def _rate_limit_reset_info(headers) -> tuple[str | None, str | None, str | None]:
+    """Extract a human-readable rate-limit reset time from response headers."""
+    now = datetime.now().astimezone()
+
+    retry_after = headers.get("Retry-After")
+    if retry_after:
+        value = retry_after.strip()
+        try:
+            seconds = max(0, int(float(value)))
+            retry_at = now + timedelta(seconds=seconds)
+            return str(seconds), retry_at.strftime("%Y-%m-%d %H:%M:%S %Z"), "Retry-After"
+        except (TypeError, ValueError):
+            try:
+                retry_at_dt = parsedate_to_datetime(value)
+                if retry_at_dt.tzinfo is None:
+                    retry_at_dt = retry_at_dt.replace(tzinfo=timezone.utc)
+                retry_at_local = retry_at_dt.astimezone()
+                seconds = max(0, int((retry_at_local - now).total_seconds()))
+                return str(seconds), retry_at_local.strftime("%Y-%m-%d %H:%M:%S %Z"), "Retry-After"
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+    for header_name in ("X-RateLimit-Reset", "RateLimit-Reset"):
+        reset_value = headers.get(header_name)
+        if not reset_value:
+            continue
+        try:
+            reset_epoch = float(reset_value)
+            retry_at_local = datetime.fromtimestamp(reset_epoch, tz=timezone.utc).astimezone()
+            seconds = max(0, int((retry_at_local - now).total_seconds()))
+            return str(seconds), retry_at_local.strftime("%Y-%m-%d %H:%M:%S %Z"), header_name
+        except (TypeError, ValueError, OverflowError, OSError):
+            continue
+
+    return None, None, None
 
 
 def _patch_blinkpy_oauth_signin() -> None:
@@ -78,12 +129,30 @@ def _patch_blinkpy_oauth_signin() -> None:
             return "SUCCESS"
 
         if response.status == 429:
-            retry_after = response.headers.get("Retry-After")
-            logger.warning(
-                "Blink OAuth signin rate-limited (HTTP 429)%s",
-                f"; Retry-After={retry_after}" if retry_after else "",
-            )
-            raise BlinkRateLimitError(retry_after)
+            retry_after, retry_at, reset_source = _rate_limit_reset_info(response.headers)
+            if retry_at:
+                logger.warning(
+                    "Blink OAuth signin rate-limited (HTTP 429); retry at %s (%s seconds, source=%s)",
+                    retry_at,
+                    retry_after,
+                    reset_source,
+                )
+            else:
+                interesting_headers = {
+                    key: value
+                    for key, value in response.headers.items()
+                    if "rate" in key.lower() or "retry" in key.lower()
+                }
+                if interesting_headers:
+                    logger.warning(
+                        "Blink OAuth signin rate-limited (HTTP 429); no parseable reset time; headers=%s",
+                        interesting_headers,
+                    )
+                else:
+                    logger.warning(
+                        "Blink OAuth signin rate-limited (HTTP 429); Blink supplied no rate-limit reset headers"
+                    )
+            raise BlinkRateLimitError(retry_after, retry_at, reset_source)
 
         if not response_text:
             response_text = await response.text()
