@@ -143,17 +143,18 @@ def _redact_text(text: str, content_type: str = "") -> str:
 
     # Best-effort fallback for JSON-like or key=value secrets in plain text.
     redacted = text
-    sensitive_pattern = "|".join(re.escape(item) for item in _SECRET_FRAGMENTS + _IDENTITY_FRAGMENTS)
-    redacted = re.sub(
-        rf'(?i)(["\']?(?:{sensitive_pattern})["\']?\s*[:=]\s*)["\']?[^,&\s}}]+',
-        r'\1[REDACTED]',
-        redacted,
+    sensitive_pattern = "|".join(
+        re.escape(item) for item in _SECRET_FRAGMENTS + _IDENTITY_FRAGMENTS
     )
+    pattern = rf"(?i)([\"']?(?:{sensitive_pattern})[\"']?\s*[:=]\s*)[\"']?[^,&\s}}]+"
+    redacted = re.sub(pattern, r"\1[REDACTED]", redacted)
     return redacted
 
 
 def _format_headers(headers: Any) -> str:
-    return json.dumps(_redact_mapping(headers), ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(
+        _redact_mapping(headers), ensure_ascii=False, separators=(",", ":")
+    )
 
 
 def _is_binary_response(content_type: str, url: str) -> bool:
@@ -163,7 +164,15 @@ def _is_binary_response(content_type: str, url: str) -> bool:
     lowered_url = url.lower()
     return any(
         marker in lowered_url
-        for marker in ("/media/", "/thumbnail", ".jpg", ".jpeg", ".png", ".mp4", ".m3u8")
+        for marker in (
+            "/media/",
+            "/thumbnail",
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".mp4",
+            ".m3u8",
+        )
     )
 
 
@@ -204,16 +213,30 @@ def create_blink_http_trace_config() -> TraceConfig:
             return
         try:
             text = body.decode("utf-8", errors="replace")
-            text = _redact_text(text, getattr(ctx, "request_content_type", ""))
-            suffix = " …[truncated]" if getattr(ctx, "request_body_truncated", False) else ""
+            text = _redact_text(
+                text, getattr(ctx, "request_content_type", "")
+            )
+            suffix = (
+                " …[truncated]"
+                if getattr(ctx, "request_body_truncated", False)
+                else ""
+            )
             LOGGER.info("→ body %s%s", text, suffix)
         except Exception as error:
-            LOGGER.warning("Blink HTTP trace request-body formatting error: %s", error)
+            LOGGER.warning(
+                "Blink HTTP trace request-body formatting error: %s", error
+            )
 
     async def on_request_end(session, ctx, params) -> None:
         try:
             log_request_body(ctx)
-            elapsed_ms = int((time.perf_counter() - getattr(ctx, "started_at", time.perf_counter())) * 1000)
+            elapsed_ms = int(
+                (
+                    time.perf_counter()
+                    - getattr(ctx, "started_at", time.perf_counter())
+                )
+                * 1000
+            )
             response = params.response
             response_url = _redact_url(response.url)
             LOGGER.info(
@@ -243,7 +266,13 @@ def create_blink_http_trace_config() -> TraceConfig:
     async def on_request_exception(session, ctx, params) -> None:
         try:
             log_request_body(ctx)
-            elapsed_ms = int((time.perf_counter() - getattr(ctx, "started_at", time.perf_counter())) * 1000)
+            elapsed_ms = int(
+                (
+                    time.perf_counter()
+                    - getattr(ctx, "started_at", time.perf_counter())
+                )
+                * 1000
+            )
             LOGGER.info(
                 "× %s %s (%dms): %s",
                 params.method,
@@ -263,16 +292,15 @@ def create_blink_http_trace_config() -> TraceConfig:
             # ClientResponse.read() normally emits this callback once with the
             # complete body. Avoid dumping media regardless of body size.
             response_url = _redact_url(params.url)
-            content_type = ""
-            # TraceResponseChunkReceivedParams does not expose response headers,
-            # so use URL hints plus a text-decode heuristic here.
-            if _is_binary_response(content_type, response_url):
+            if _is_binary_response("", response_url):
                 LOGGER.info("← body <binary payload: %d bytes>", len(chunk))
                 return
 
             sample = chunk[:limit] if limit > 0 else b""
             if not sample:
-                LOGGER.info("← body <%d bytes; body logging disabled>", len(chunk))
+                LOGGER.info(
+                    "← body <%d bytes; body logging disabled>", len(chunk)
+                )
                 return
 
             # Treat payload as binary if it contains NULs or cannot reasonably
@@ -284,7 +312,9 @@ def create_blink_http_trace_config() -> TraceConfig:
             text = sample.decode("utf-8", errors="replace")
             replacement_ratio = text.count("\ufffd") / max(len(text), 1)
             if replacement_ratio > 0.05:
-                LOGGER.info("← body <binary/non-text payload: %d bytes>", len(chunk))
+                LOGGER.info(
+                    "← body <binary/non-text payload: %d bytes>", len(chunk)
+                )
                 return
 
             text = _redact_text(text)
