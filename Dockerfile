@@ -17,6 +17,12 @@ RUN apt-get update && apt-get install -y \
 # Copy app directory contents
 COPY app/ /app/
 
+# Blink may return HTTP 202 (as well as 412) when a 2FA challenge is pending.
+# The pinned blinkpy revision only recognizes 412, so patch that single condition
+# without pulling in unrelated changes from newer blinkpy revisions.
+RUN sed -i 's/if response.status == 412:/if response.status in [202, 412]:/' \
+    /app/blinkpy/blinkpy/api.py
+
 # Install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r /app/requirements.txt
@@ -28,8 +34,8 @@ RUN chmod +x /app/startup.sh /app/healthcheck.py
 RUN mkdir -p /data
 
 # Add healthcheck
-# Runs every 30 seconds, starts checking after 60 seconds, 
-# allows 10 seconds for the check to complete, 
+# Runs every 30 seconds, starts checking after 60 seconds,
+# allows 10 seconds for the check to complete,
 # marks unhealthy after 3 consecutive failures
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD python3 /app/healthcheck.py || exit 1
@@ -47,6 +53,3 @@ STOPSIGNAL SIGTERM
 
 # Set entry point
 CMD ["./startup.sh"]
-
-
-
