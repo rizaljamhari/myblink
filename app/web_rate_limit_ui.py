@@ -24,6 +24,7 @@ _RATE_LIMIT_UI = r"""
 (() => {
     const originalFetch = window.fetch.bind(window);
     let countdownTimer = null;
+    let overrideInProgress = false;
 
     function formatRemaining(totalSeconds) {
         const seconds = Math.max(0, Math.floor(totalSeconds));
@@ -39,6 +40,53 @@ _RATE_LIMIT_UI = r"""
         return parts.join(' ');
     }
 
+    function tryLoginAnyway() {
+        const confirmed = window.confirm(
+            'Blink reports an active 2FA rate limit. Trying again now may still fail ' +
+            'and could extend the lockout period. Do you want to continue anyway?'
+        );
+        if (!confirmed) return;
+
+        overrideInProgress = true;
+        if (countdownTimer) {
+            clearInterval(countdownTimer);
+            countdownTimer = null;
+        }
+
+        const submitButton = document.getElementById('submitBtn');
+        const form = document.getElementById('configForm');
+        if (!submitButton || !form) return;
+
+        submitButton.disabled = false;
+        submitButton.textContent = 'Connect to Blink';
+        form.requestSubmit();
+    }
+
+    function appendOverrideButton(errorBox, remaining) {
+        if (remaining <= 0) return;
+
+        const warning = document.createElement('div');
+        warning.style.marginTop = '10px';
+        warning.style.fontSize = '12px';
+        warning.style.opacity = '0.9';
+        warning.textContent = 'You can override this local lockout, but Blink may reject the request and may extend the rate limit.';
+        errorBox.appendChild(warning);
+
+        const overrideButton = document.createElement('button');
+        overrideButton.type = 'button';
+        overrideButton.textContent = 'Try login anyway';
+        overrideButton.style.marginTop = '10px';
+        overrideButton.style.padding = '9px 14px';
+        overrideButton.style.borderRadius = '7px';
+        overrideButton.style.border = '1px solid currentColor';
+        overrideButton.style.background = 'transparent';
+        overrideButton.style.color = 'inherit';
+        overrideButton.style.cursor = 'pointer';
+        overrideButton.style.fontWeight = '600';
+        overrideButton.addEventListener('click', tryLoginAnyway);
+        errorBox.appendChild(overrideButton);
+    }
+
     function renderRateLimit(data) {
         if (!data || !data.rate_limited) return;
 
@@ -52,6 +100,7 @@ _RATE_LIMIT_UI = r"""
         }
         if (!Number.isFinite(retryAtMs)) return;
 
+        overrideInProgress = false;
         if (countdownTimer) {
             clearInterval(countdownTimer);
             countdownTimer = null;
@@ -67,6 +116,8 @@ _RATE_LIMIT_UI = r"""
         });
 
         function update() {
+            if (overrideInProgress) return;
+
             const remaining = Math.max(0, Math.ceil((retryAtMs - Date.now()) / 1000));
 
             errorBox.replaceChildren();
@@ -95,6 +146,7 @@ _RATE_LIMIT_UI = r"""
                 errorBox.appendChild(causeLine);
             }
 
+            appendOverrideButton(errorBox, remaining);
             errorBox.classList.add('show');
 
             if (remaining > 0) {
@@ -123,6 +175,7 @@ _RATE_LIMIT_UI = r"""
         if (url.includes('/api/config/save') || url.includes('/api/config/current')) {
             response.clone().json().then(data => {
                 if (data && data.rate_limited) {
+                    overrideInProgress = false;
                     // Let the page's existing submit handler finish first, then
                     // replace its generic error with the structured countdown.
                     setTimeout(() => renderRateLimit(data), 50);
