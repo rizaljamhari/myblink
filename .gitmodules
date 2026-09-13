@@ -7,3 +7,15 @@
 [submodule "blinkbridge"]
 	path = blinkbridge
 	url = https://github.com/roger-/blinkbridge.git
+[submodule "BlinkMonitorProtocol"]
+	path = BlinkMonitorProtocol
+	url = https://github.com/MattTW/BlinkMonitorProtocol.git
+[submodule "blink-immis-proxy"]
+	path = blink-immis-proxy
+	url = https://github.com/jakecrowley/blink-immis-proxy.git
+[submodule "blink-liveview-middleware"]
+	path = blink-liveview-middleware
+	url = https://github.com/amattu2/blink-liveview-middleware.git
+[submodule "node-blink-security"]
+	path = node-blink-security
+	url = https://github.com/madshall/node-blink-security.git
