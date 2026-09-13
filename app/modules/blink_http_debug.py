@@ -39,6 +39,7 @@ _SECRET_FRAGMENTS = (
     "api_key",
     "apikey",
 )
+_SECRET_EXACT = {"code", "authorization_code"}
 _IDENTITY_FRAGMENTS = ("username", "email")
 _BINARY_CONTENT_PREFIXES = ("image/", "video/", "audio/", "application/octet-stream")
 
@@ -61,13 +62,19 @@ def _body_limit() -> int:
         return DEFAULT_BODY_LIMIT
 
 
+def _normalized_name(name: str) -> str:
+    return name.lower().replace("-", "_")
+
+
 def _is_sensitive_name(name: str) -> bool:
-    lowered = name.lower().replace("-", "_")
-    return any(fragment in lowered for fragment in _SECRET_FRAGMENTS)
+    lowered = _normalized_name(name)
+    return lowered in _SECRET_EXACT or any(
+        fragment in lowered for fragment in _SECRET_FRAGMENTS
+    )
 
 
 def _is_identity_name(name: str) -> bool:
-    lowered = name.lower().replace("-", "_")
+    lowered = _normalized_name(name)
     return any(fragment in lowered for fragment in _IDENTITY_FRAGMENTS)
 
 
@@ -75,19 +82,6 @@ def _redact_value(name: str, value: Any) -> Any:
     if _is_sensitive_name(name) or _is_identity_name(name):
         return "[REDACTED]"
     return value
-
-
-def _redact_mapping(mapping: Any) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    try:
-        items = mapping.items()
-    except AttributeError:
-        return result
-
-    for key, value in items:
-        key_str = str(key)
-        result[key_str] = _redact_value(key_str, value)
-    return result
 
 
 def _redact_url(url: Any) -> str:
@@ -103,6 +97,24 @@ def _redact_url(url: Any) -> str:
         )
     except Exception:
         return raw
+
+
+def _redact_mapping(mapping: Any) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    try:
+        items = mapping.items()
+    except AttributeError:
+        return result
+
+    for key, value in items:
+        key_str = str(key)
+        if _is_sensitive_name(key_str) or _is_identity_name(key_str):
+            result[key_str] = "[REDACTED]"
+        elif isinstance(value, str) and value.startswith(("http://", "https://")):
+            result[key_str] = _redact_url(value)
+        else:
+            result[key_str] = value
+    return result
 
 
 def _redact_json(value: Any) -> Any:
@@ -143,9 +155,8 @@ def _redact_text(text: str, content_type: str = "") -> str:
 
     # Best-effort fallback for JSON-like or key=value secrets in plain text.
     redacted = text
-    sensitive_pattern = "|".join(
-        re.escape(item) for item in _SECRET_FRAGMENTS + _IDENTITY_FRAGMENTS
-    )
+    sensitive_names = _SECRET_FRAGMENTS + _IDENTITY_FRAGMENTS + tuple(_SECRET_EXACT)
+    sensitive_pattern = "|".join(re.escape(item) for item in sensitive_names)
     pattern = rf"(?i)([\"']?(?:{sensitive_pattern})[\"']?\s*[:=]\s*)[\"']?[^,&\s}}]+"
     redacted = re.sub(pattern, r"\1[REDACTED]", redacted)
     return redacted
@@ -189,6 +200,7 @@ def create_blink_http_trace_config() -> TraceConfig:
             ctx.request_content_type = params.headers.get("Content-Type", "")
             ctx.request_body = bytearray()
             ctx.request_body_truncated = False
+            ctx.response_content_type = ""
             LOGGER.info("→ %s %s", params.method, ctx.request_url)
             LOGGER.info("→ headers %s", _format_headers(params.headers))
         except Exception as error:
@@ -239,6 +251,7 @@ def create_blink_http_trace_config() -> TraceConfig:
             )
             response = params.response
             response_url = _redact_url(response.url)
+            ctx.response_content_type = response.headers.get("Content-Type", "")
             LOGGER.info(
                 "← %s %s %s (%dms)",
                 response.status,
@@ -247,6 +260,19 @@ def create_blink_http_trace_config() -> TraceConfig:
                 elapsed_ms,
             )
             LOGGER.info("← headers %s", _format_headers(response.headers))
+
+            # If a small textual response has a known length, read it now so
+            # it is logged even if BlinkPy only inspects the status/headers.
+            # aiohttp caches ClientResponse.read(), so later callers still see
+            # the same body without another network read.
+            content_length = response.content_length
+            if (
+                limit > 0
+                and content_length is not None
+                and 0 < content_length <= limit
+                and not _is_binary_response(ctx.response_content_type, response_url)
+            ):
+                await response.read()
         except Exception as error:
             LOGGER.warning("Blink HTTP trace request-end error: %s", error)
 
@@ -289,10 +315,9 @@ def create_blink_http_trace_config() -> TraceConfig:
             if not chunk:
                 return
 
-            # ClientResponse.read() normally emits this callback once with the
-            # complete body. Avoid dumping media regardless of body size.
             response_url = _redact_url(params.url)
-            if _is_binary_response("", response_url):
+            content_type = getattr(ctx, "response_content_type", "")
+            if _is_binary_response(content_type, response_url):
                 LOGGER.info("← body <binary payload: %d bytes>", len(chunk))
                 return
 
@@ -303,8 +328,6 @@ def create_blink_http_trace_config() -> TraceConfig:
                 )
                 return
 
-            # Treat payload as binary if it contains NULs or cannot reasonably
-            # be represented as text.
             if b"\x00" in sample:
                 LOGGER.info("← body <binary payload: %d bytes>", len(chunk))
                 return
@@ -317,7 +340,7 @@ def create_blink_http_trace_config() -> TraceConfig:
                 )
                 return
 
-            text = _redact_text(text)
+            text = _redact_text(text, content_type)
             suffix = " …[truncated]" if len(chunk) > len(sample) else ""
             LOGGER.info("← body %s%s", text, suffix)
         except Exception as error:
