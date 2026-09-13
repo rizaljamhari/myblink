@@ -1,19 +1,14 @@
 aiofiles==24.1.0
-aiohttp==3.9.5
-aiosignal==1.3.1
-async-timeout==4.0.3
-attrs==23.2.0
+aiohttp==3.14.3
 ./blinkpy
 certifi==2024.7.4
 charset-normalizer==3.3.2
 flask==3.0.0
-frozenlist==1.4.1
 idna==3.7
-multidict==6.0.5
 python-dateutil==2.9.0.post0
 python-slugify==8.0.4
 PyYAML==6.0.1
-requests==2.32.3
+requests==2.34.2
 schedule==1.2.2
 six==1.16.0
 sortedcontainers==2.4.0
@@ -21,7 +16,6 @@ text-unidecode==1.3
 urllib3==2.2.2
 validators==0.33.0
 ./python-voipms
-yarl==1.9.4
 
 # Authentication dependencies
 flask-login==0.6.3

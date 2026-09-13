@@ -17,12 +17,6 @@ RUN apt-get update && apt-get install -y \
 # Copy app directory contents
 COPY app/ /app/
 
-# Blink may return HTTP 202 (as well as 412) when a 2FA challenge is pending.
-# The pinned blinkpy revision only recognizes 412, so patch that single condition
-# without pulling in unrelated changes from newer blinkpy revisions.
-RUN sed -i 's/if response.status == 412:/if response.status in [202, 412]:/' \
-    /app/blinkpy/blinkpy/api.py
-
 # Install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r /app/requirements.txt
