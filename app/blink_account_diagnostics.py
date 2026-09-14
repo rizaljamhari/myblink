@@ -1,7 +1,7 @@
 """Read-only Blink account diagnostics exposed in the MyBlink settings UI.
 
-This module deliberately avoids mutating Blink account state. It queries the
-known read-only account/options endpoint and inspects already-loaded BlinkPy
+This module deliberately avoids mutating Blink account state. It queries known
+read-only account/subscription endpoints and inspects already-loaded BlinkPy
 homescreen/sync metadata for subscription, legacy, storage, and retention
 signals that can help explain unusual account entitlements.
 """
@@ -30,6 +30,23 @@ _RELEVANT_KEY_PARTS = (
     "cloud",
 )
 
+_STRUCTURED_CONTAINER_KEY_PARTS = (
+    "subscription",
+    "entitlement",
+    "feature_plan",
+    "plans",
+    "trial",
+)
+
+_ACCOUNT_OPTION_SIGNAL_PARTS = (
+    "legacy",
+    "subs",
+    "trial",
+    "plan",
+    "storage",
+    "clip_list_limit",
+)
+
 _SENSITIVE_KEY_PARTS = (
     "password",
     "token",
@@ -38,6 +55,14 @@ _SENSITIVE_KEY_PARTS = (
     "secret",
     "email",
     "phone",
+    "hardware_id",
+    "device_id",
+    "client_secret",
+    "first_name",
+    "last_name",
+    "full_name",
+    "address",
+    "postal",
 )
 
 
@@ -60,6 +85,35 @@ def _safe_primitive(value: Any) -> Any:
         ):
             return list(value)
     return None
+
+
+def _sanitize_structure(value: Any, depth: int = 0) -> Any:
+    """Recursively sanitize diagnostic payloads while preserving useful structure."""
+    if depth > 8:
+        return "[max depth reached]"
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for index, (key, child) in enumerate(value.items()):
+            if index >= 200:
+                result["__truncated__"] = f"{len(value) - 200} more field(s) omitted"
+                break
+            key_text = str(key)
+            if _is_sensitive_key(key_text):
+                continue
+            result[key_text] = _sanitize_structure(child, depth + 1)
+        return result
+
+    if isinstance(value, (list, tuple)):
+        items = [_sanitize_structure(child, depth + 1) for child in value[:100]]
+        if len(value) > 100:
+            items.append(f"[{len(value) - 100} more item(s) omitted]")
+        return items
+
+    return str(value)
 
 
 def _safe_options(options: Any) -> dict[str, Any]:
@@ -110,6 +164,46 @@ def _collect_relevant_signals(
     return result
 
 
+def _collect_structured_containers(
+    value: Any,
+    prefix: str = "homescreen",
+    depth: int = 0,
+    result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Preserve whole sanitized plan/subscription containers and their child fields."""
+    if result is None:
+        result = {}
+    if depth > 7:
+        return result
+
+    if isinstance(value, dict):
+        for key, child in value.items():
+            key_text = str(key)
+            if _is_sensitive_key(key_text):
+                continue
+            path = f"{prefix}.{key_text}" if prefix else key_text
+            lowered = key_text.lower()
+
+            if isinstance(child, (dict, list, tuple)) and any(
+                part in lowered for part in _STRUCTURED_CONTAINER_KEY_PARTS
+            ):
+                result[path] = _sanitize_structure(child)
+
+            if isinstance(child, (dict, list, tuple)):
+                _collect_structured_containers(child, path, depth + 1, result)
+
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value[:100]):
+            _collect_structured_containers(
+                child,
+                f"{prefix}[{index}]",
+                depth + 1,
+                result,
+            )
+
+    return result
+
+
 def _sync_summaries(blink) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     syncs = getattr(blink, "sync", {}) or {}
@@ -130,6 +224,61 @@ def _sync_summaries(blink) -> list[dict[str, Any]]:
         summaries.append(row)
 
     return summaries
+
+
+async def _query_read_only_json(auth, url: str) -> tuple[Any, str | None]:
+    """Query a Blink GET endpoint and return a sanitized payload plus any error."""
+    try:
+        payload = await auth.query(
+            url=url,
+            headers=auth.header,
+            reqtype="get",
+        )
+        if payload is None:
+            return None, "Blink returned no payload"
+        if not isinstance(payload, (dict, list, tuple)):
+            return _sanitize_structure(payload), (
+                f"Unexpected response type: {type(payload).__name__}"
+            )
+        return _sanitize_structure(payload), None
+    except Exception as error:  # diagnostics must never disrupt the application
+        return None, str(error) or type(error).__name__
+
+
+async def _collect_subscription_api(blink, base_url: str | None) -> dict[str, Any]:
+    """Query current Blink read-only subscription endpoints from Android API evidence."""
+    auth = getattr(blink, "auth", None)
+    account_id = getattr(blink, "account_id", None)
+
+    result: dict[str, Any] = {
+        "access": None,
+        "entitlements": None,
+        "plans": None,
+        "errors": {},
+    }
+
+    if auth is None or not base_url or account_id is None:
+        result["errors"]["subscription_api"] = (
+            "Blink authentication session, base URL, or account ID is unavailable"
+        )
+        return result
+
+    root = base_url.rstrip("/")
+    endpoints = {
+        "access": f"{root}/api/v1/accounts/{account_id}/access",
+        "entitlements": (
+            f"{root}/api/v2/accounts/{account_id}/subscriptions/entitlements"
+        ),
+        "plans": f"{root}/api/v3/accounts/{account_id}/subscriptions/plans",
+    }
+
+    for name, url in endpoints.items():
+        payload, error = await _query_read_only_json(auth, url)
+        result[name] = payload
+        if error:
+            result["errors"][name] = error
+
+    return result
 
 
 async def _collect_diagnostics(blink) -> dict[str, Any]:
@@ -168,8 +317,22 @@ async def _collect_diagnostics(blink) -> dict[str, Any]:
         except Exception as error:  # diagnostics must not break the settings page
             account_options_error = str(error) or type(error).__name__
 
+    subscription_api = await _collect_subscription_api(blink, base_url)
+
     homescreen = getattr(blink, "homescreen", {}) or {}
     homescreen_signals = _collect_relevant_signals(homescreen)
+    structured_homescreen = _collect_structured_containers(homescreen)
+    homescreen_top_level_keys = (
+        sorted(str(key) for key in homescreen.keys())
+        if isinstance(homescreen, dict)
+        else []
+    )
+
+    account_option_signals = {
+        key: value
+        for key, value in account_options.items()
+        if any(part in key.lower() for part in _ACCOUNT_OPTION_SIGNAL_PARTS)
+    }
 
     # Surface the most useful evidence separately for quick reading.
     legacy_account_mini = account_options.get("legacy_account_mini")
@@ -208,13 +371,17 @@ async def _collect_diagnostics(blink) -> dict[str, Any]:
         "read_only": True,
         "account": account,
         "account_options": account_options,
+        "account_option_signals": account_option_signals,
         "account_options_error": account_options_error,
         "legacy_account_mini": legacy_account_mini,
+        "subscription_api": subscription_api,
         "feature_plan_signals": feature_plan_signals,
         "subscription_signals": subscription_signals,
+        "structured_homescreen": structured_homescreen,
         "retention_signals": retention_signals,
         "storage_signals": storage_signals,
         "homescreen_signals": homescreen_signals,
+        "homescreen_top_level_keys": homescreen_top_level_keys,
         "sync_modules": _sync_summaries(blink),
     }
 
@@ -243,6 +410,16 @@ _UI_PATCH_JS = r"""
         `).join('');
     }
 
+    function renderJson(value, emptyText = 'No data returned by Blink.') {
+        if (value === null || value === undefined) {
+            return `<div style="color:var(--text-secondary);">${app.escapeHtml(emptyText)}</div>`;
+        }
+        if (typeof value === 'object' && Object.keys(value).length === 0) {
+            return `<div style="color:var(--text-secondary);">${app.escapeHtml(emptyText)}</div>`;
+        }
+        return `<pre style="margin-top:0.5rem;max-height:360px;overflow:auto;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:0.8rem;font-size:0.8rem;">${app.escapeHtml(JSON.stringify(value, null, 2))}</pre>`;
+    }
+
     function renderDiagnostics(data) {
         const result = document.getElementById('blinkAccountDiagnosticsResult');
         if (!result) return;
@@ -255,9 +432,14 @@ _UI_PATCH_JS = r"""
                 : 'Unknown — flag was not returned';
 
         const account = data.account || {};
+        const subscriptionApi = data.subscription_api || {};
+        const subscriptionErrors = subscriptionApi.errors || {};
         const optionsError = data.account_options_error
             ? `<div style="margin-top:0.5rem;color:var(--warning);">account/options: ${app.escapeHtml(data.account_options_error)}</div>`
             : '';
+        const subscriptionErrorHtml = Object.entries(subscriptionErrors).map(([name, error]) =>
+            `<div style="margin-top:0.35rem;color:var(--warning);">${app.escapeHtml(name)}: ${app.escapeHtml(String(error))}</div>`
+        ).join('');
 
         result.innerHTML = `
             <div style="margin-top:1rem;">
@@ -277,13 +459,39 @@ _UI_PATCH_JS = r"""
                 </div>
 
                 ${optionsError}
+                ${subscriptionErrorHtml}
 
                 <details open style="margin-top:1rem;">
-                    <summary style="cursor:pointer;font-weight:600;">Account Options</summary>
+                    <summary style="cursor:pointer;font-weight:600;">Subscription API — Plans</summary>
+                    ${renderJson(subscriptionApi.plans, 'Blink did not return a subscription-plans payload.')}
+                </details>
+
+                <details open style="margin-top:1rem;">
+                    <summary style="cursor:pointer;font-weight:600;">Subscription API — Entitlements</summary>
+                    ${renderJson(subscriptionApi.entitlements, 'Blink did not return an entitlements payload.')}
+                </details>
+
+                <details style="margin-top:1rem;">
+                    <summary style="cursor:pointer;font-weight:600;">Subscription API — Account Access</summary>
+                    ${renderJson(subscriptionApi.access, 'Blink did not return an account-access payload.')}
+                </details>
+
+                <details open style="margin-top:1rem;">
+                    <summary style="cursor:pointer;font-weight:600;">Account Subscription / Trial Flags</summary>
+                    <div style="margin-top:0.5rem;">${renderKeyValueRows(data.account_option_signals)}</div>
+                </details>
+
+                <details style="margin-top:1rem;">
+                    <summary style="cursor:pointer;font-weight:600;">All Account Options</summary>
                     <div style="margin-top:0.5rem;">${renderKeyValueRows(data.account_options)}</div>
                 </details>
 
                 <details open style="margin-top:1rem;">
+                    <summary style="cursor:pointer;font-weight:600;">Structured Homescreen Plan / Subscription Objects</summary>
+                    ${renderJson(data.structured_homescreen, 'No structured plan/subscription containers were present in the loaded homescreen.')}
+                </details>
+
+                <details style="margin-top:1rem;">
                     <summary style="cursor:pointer;font-weight:600;">Feature / Plan Signals</summary>
                     <div style="margin-top:0.5rem;">${renderKeyValueRows(data.feature_plan_signals)}</div>
                 </details>
@@ -304,8 +512,13 @@ _UI_PATCH_JS = r"""
                 </details>
 
                 <details style="margin-top:1rem;">
+                    <summary style="cursor:pointer;font-weight:600;">Homescreen Top-Level Keys</summary>
+                    ${renderJson(data.homescreen_top_level_keys)}
+                </details>
+
+                <details style="margin-top:1rem;">
                     <summary style="cursor:pointer;font-weight:600;">Raw Diagnostic JSON</summary>
-                    <pre style="margin-top:0.5rem;max-height:420px;overflow:auto;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:0.8rem;font-size:0.8rem;">${app.escapeHtml(JSON.stringify(data, null, 2))}</pre>
+                    <pre style="margin-top:0.5rem;max-height:520px;overflow:auto;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:0.8rem;font-size:0.8rem;">${app.escapeHtml(JSON.stringify(data, null, 2))}</pre>
                 </details>
             </div>
         `;
@@ -321,7 +534,7 @@ _UI_PATCH_JS = r"""
         section.innerHTML = `
             <div class="settings-title">Blink Account Diagnostics</div>
             <p style="color:var(--text-secondary);margin-bottom:0.75rem;">
-                Read-only inspection of Blink account flags and loaded subscription/storage metadata. No account settings are changed.
+                Read-only inspection of Blink account, subscription, entitlement, and storage metadata. No account settings are changed.
             </p>
             <button type="button" class="btn btn-secondary" id="runBlinkAccountDiagnosticsBtn">Run Diagnostics</button>
             <div id="blinkAccountDiagnosticsResult" style="margin-top:0.5rem;color:var(--text-secondary);">
@@ -337,7 +550,7 @@ _UI_PATCH_JS = r"""
                 button.disabled = true;
                 button.textContent = 'Checking Blink...';
             }
-            if (result) result.textContent = 'Reading account metadata from Blink...';
+            if (result) result.textContent = 'Reading account and subscription metadata from Blink...';
 
             try {
                 const response = await fetch('/api/blink/account-diagnostics');
@@ -407,7 +620,7 @@ def apply_blink_account_diagnostics() -> None:
                         _collect_diagnostics(blink),
                         event_loop,
                     )
-                    data = future.result(timeout=30)
+                    data = future.result(timeout=45)
                     return jsonify(data)
                 except Exception as error:
                     self.logger.error(
