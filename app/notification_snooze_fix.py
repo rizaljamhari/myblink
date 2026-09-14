@@ -5,14 +5,16 @@ MyBlink previously used ScheduleAction.SNOOZE for motion detection disable in th
 scheduler even though the direct camera snooze endpoint already called Blink's
 real snooze API. This patch separates the two behaviors without modifying the
 pinned BlinkPy submodule.
+
+Blink's snooze_time field is expressed in MINUTES. The Blink API currently
+accepts 1..1439 minutes. The pinned BlinkPy revision incorrectly documents the
+value as seconds, so this layer normalizes units and validates API error bodies.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from functools import wraps
-from typing import Any
 
 from modules.blink_handler import BlinkHandler
 from modules.db_models import ScheduleAction, ScheduleTarget
@@ -21,6 +23,8 @@ from web_server import WebServer
 
 
 LOGGER = logging.getLogger(__name__)
+MIN_SNOOZE_MINUTES = 1
+MAX_SNOOZE_MINUTES = 1439
 
 
 def _ensure_motion_disable_action() -> None:
@@ -38,6 +42,33 @@ def _ensure_motion_disable_action() -> None:
     type.__setattr__(ScheduleAction, "MOTION_DISABLE", member)
 
 
+def _normalize_snooze_minutes(value: float | int) -> int:
+    """Convert a requested duration to Blink's supported minute range."""
+    requested = max(MIN_SNOOZE_MINUTES, int(round(float(value))))
+    return min(MAX_SNOOZE_MINUTES, requested)
+
+
+def _snooze_result_succeeded(result) -> tuple[bool, str | None]:
+    """Validate Blink's snooze response, including HTTP-200 error bodies."""
+    if result is None:
+        return False, "Blink returned no response"
+
+    if isinstance(result, dict):
+        code = result.get("code")
+        message = str(result.get("message") or "").strip()
+
+        # Blink can return HTTP 200 with an application-level error such as:
+        # {"message": "Unsupported value for snooze time", "code": 2800}
+        if code not in (None, 0, "0"):
+            return False, f"Blink rejected snooze: code={code}, message={message or 'unknown'}"
+
+        lowered = message.lower()
+        if "unsupported" in lowered or "error" in lowered or "failed" in lowered:
+            return False, f"Blink rejected snooze: {message}"
+
+    return True, None
+
+
 def _patch_blink_handler() -> None:
     """Add explicit per-camera notification snooze helpers."""
     original_unsnooze_camera = BlinkHandler.unsnooze_camera
@@ -45,49 +76,89 @@ def _patch_blink_handler() -> None:
     async def set_camera_notification_snooze(
         self,
         camera_name: str,
-        duration_seconds: int,
+        duration_minutes: int,
     ) -> bool:
         camera = self._find_camera_in_blink(camera_name)
         if not camera:
             self.logger.error("Camera '%s' not found for notification snooze", camera_name)
             return False
 
-        seconds = max(0, int(duration_seconds))
+        requested_minutes = int(round(float(duration_minutes)))
+        minutes = _normalize_snooze_minutes(requested_minutes)
+        if minutes != requested_minutes:
+            self.logger.warning(
+                "Adjusted notification snooze for camera '%s' from %s to %s minutes "
+                "(Blink supports %s..%s minutes)",
+                camera_name,
+                requested_minutes,
+                minutes,
+                MIN_SNOOZE_MINUTES,
+                MAX_SNOOZE_MINUTES,
+            )
+
         self.logger.info(
-            "Setting notification snooze for camera '%s' to %s seconds",
+            "Setting notification snooze for camera '%s' to %s minutes",
             camera_name,
-            seconds,
+            minutes,
         )
 
         try:
-            result = await camera.async_snooze(seconds)
-            if result is None:
-                self.logger.warning(
-                    "Notification snooze returned no result for camera '%s'",
+            # The pinned BlinkPy revision labels this argument as seconds, but
+            # it forwards the value unchanged. Blink itself interprets it as minutes.
+            result = await camera.async_snooze(minutes)
+            success, error = _snooze_result_succeeded(result)
+            if not success:
+                self.logger.error(
+                    "Notification snooze rejected for camera '%s': %s; response=%r",
                     camera_name,
+                    error,
+                    result,
                 )
                 return False
+
+            self.logger.info(
+                "Blink accepted notification snooze for camera '%s': %r",
+                camera_name,
+                result,
+            )
             return True
         except Exception as error:
             self.logger.error(
                 "Failed to set notification snooze for camera '%s': %s",
                 camera_name,
                 error,
+                exc_info=True,
             )
             return False
 
     async def unsnooze_camera(self, camera_name: str) -> bool:
-        """Clear notification snooze directly, falling back to the legacy reset."""
+        """End a camera notification snooze as quickly as Blink allows."""
         camera = self._find_camera_in_blink(camera_name)
         if camera:
             try:
+                # Blink rejects snooze_time=0. One minute is the documented
+                # practical way to end an existing per-camera snooze quickly.
                 self.logger.info(
-                    "Clearing notification snooze for camera '%s' with snooze_time=0",
+                    "Ending notification snooze for camera '%s' with snooze_time=1 minute",
                     camera_name,
                 )
-                result = await camera.async_snooze(0)
-                if result is not None:
+                result = await camera.async_snooze(MIN_SNOOZE_MINUTES)
+                success, error = _snooze_result_succeeded(result)
+                if success:
+                    self.logger.info(
+                        "Blink accepted notification unsnooze request for camera '%s': %r",
+                        camera_name,
+                        result,
+                    )
                     return True
+
+                self.logger.warning(
+                    "Direct notification unsnooze failed for '%s': %s; response=%r; "
+                    "using legacy fallback",
+                    camera_name,
+                    error,
+                    result,
+                )
             except Exception as error:
                 self.logger.warning(
                     "Direct notification unsnooze failed for '%s': %s; using legacy fallback",
@@ -120,10 +191,13 @@ def _patch_schedule_executor() -> None:
                 duration_hours = getattr(
                     self.blink_handler.config, "default_duration_hours", 1
                 ) or 1
-            duration_seconds = max(60, int(float(duration_hours) * 3600))
+
+            duration_minutes = _normalize_snooze_minutes(
+                float(duration_hours) * 60
+            )
             success = await self.blink_handler.set_camera_notification_snooze(
                 rule.target_name,
-                duration_seconds,
+                duration_minutes,
             )
             if not success:
                 raise RuntimeError(
@@ -243,14 +317,16 @@ def _patch_camera_snooze_route() -> None:
 
                 if enabled:
                     if duration_hours is None:
-                        duration_seconds = 300  # Preserve old quick-toggle default.
+                        duration_minutes = 5  # Preserve the old quick-toggle default.
                     else:
-                        duration_seconds = max(60, int(float(duration_hours) * 3600))
+                        duration_minutes = _normalize_snooze_minutes(
+                            float(duration_hours) * 60
+                        )
 
                     future = asyncio.run_coroutine_threadsafe(
                         handler.set_camera_notification_snooze(
                             camera_name,
-                            duration_seconds,
+                            duration_minutes,
                         ),
                         self.myblink_app._event_loop,
                     )
@@ -263,7 +339,8 @@ def _patch_camera_snooze_route() -> None:
                             "success": True,
                             "message": "Camera notifications snoozed",
                             "notification_snoozed": True,
-                            "duration_seconds": duration_seconds,
+                            "duration_minutes": duration_minutes,
+                            "duration_seconds": duration_minutes * 60,
                         }
                     )
 
@@ -278,7 +355,7 @@ def _patch_camera_snooze_route() -> None:
                 return jsonify(
                     {
                         "success": True,
-                        "message": "Camera notification snooze cleared",
+                        "message": "Camera notification snooze will clear within about 1 minute",
                         "notification_snoozed": False,
                     }
                 )
