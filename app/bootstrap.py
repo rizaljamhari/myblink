@@ -3,6 +3,7 @@
 import myblink
 from blink_account_diagnostics import apply_blink_account_diagnostics
 from blink_cloud_media_diagnostics import apply_blink_cloud_media_diagnostics
+from blink_cloud_media_pagination_fix import apply_blink_cloud_media_pagination_fix
 from compatibility_fixes import apply_runtime_fixes
 from configure_passthrough_fix import apply_configure_passthrough_fix
 from http_debug_bootstrap import apply_http_debug_tracing
@@ -25,6 +26,7 @@ apply_notification_snooze_ui_safe()
 apply_schedule_templates_ui()
 apply_blink_account_diagnostics()
 apply_blink_cloud_media_diagnostics()
+apply_blink_cloud_media_pagination_fix()
 
 
 if __name__ == "__main__":
