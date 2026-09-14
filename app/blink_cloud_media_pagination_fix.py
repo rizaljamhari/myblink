@@ -1,16 +1,19 @@
-"""Add pagination to Blink cloud media diagnostics.
+"""Add pagination and duration accounting to Blink cloud media diagnostics.
 
 Blink's v4 media endpoint returns a bounded page of clips and accepts a numeric
-``pagination_key`` query parameter. Current public response models expose
-``limit``/``purge_id`` but no explicit next-cursor field, so this compatibility
-layer uses the final media id from each full page as the next pagination key.
+``pagination_key`` query parameter. The collector follows that cursor, combines
+all pages in the requested time window, and deduplicates media ids.
 
-The collector deduplicates media ids, aborts on a repeated cursor/no-progress
-page, and caps traversal at 50 pages to avoid runaway diagnostic requests.
+Blink media entries can also contain a JSON-encoded ``metadata`` object with
+``pts_length_ms``. That value is summed here so capped cloud storage can be
+compared with the known 7,200-second legacy allocation without assuming the
+account is necessarily using that specific quota.
 """
 
 from __future__ import annotations
 
+import json
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlencode
@@ -19,6 +22,7 @@ import blink_cloud_media_diagnostics as cloud_diag
 
 
 _MAX_MEDIA_PAGES = 50
+_REFERENCE_LEGACY_CAP_SECONDS = 7200.0
 
 
 def _media_identity(item: Any, page_number: int, item_index: int) -> tuple:
@@ -46,7 +50,122 @@ def _numeric_cursor(value: Any) -> int | None:
         return None
 
 
-def _next_pagination_key(payload: dict[str, Any], media: list[Any]) -> tuple[int | None, str | None]:
+def _numeric_duration_ms(value: Any) -> float | None:
+    """Normalize Blink's pts_length_ms value to a non-negative float."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return None
+    if duration < 0:
+        return None
+    return duration
+
+
+def _extract_pts_length_ms(item: Any) -> float | None:
+    """Extract pts_length_ms from a Blink media entry's metadata field."""
+    if not isinstance(item, dict):
+        return None
+
+    metadata = item.get("metadata")
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    if not isinstance(metadata, dict):
+        return None
+
+    return _numeric_duration_ms(metadata.get("pts_length_ms"))
+
+
+def _build_duration_summary(media: list[Any]) -> dict[str, Any]:
+    """Summarize clip duration metadata without exposing the raw metadata blob."""
+    durations_ms: list[float] = []
+    by_camera_ms: dict[str, float] = defaultdict(float)
+    by_camera_clips: dict[str, int] = defaultdict(int)
+    video_count = 0
+
+    for item in media:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "video":
+            video_count += 1
+
+        duration_ms = _extract_pts_length_ms(item)
+        if duration_ms is None:
+            continue
+
+        durations_ms.append(duration_ms)
+        camera_name = (
+            item.get("device_name")
+            or item.get("camera_name")
+            or "Unknown"
+        )
+        camera_key = str(camera_name).strip() or "Unknown"
+        by_camera_ms[camera_key] += duration_ms
+        by_camera_clips[camera_key] += 1
+
+    media_count = len(media)
+    measured_count = len(durations_ms)
+    total_ms = sum(durations_ms)
+    total_seconds = total_ms / 1000.0
+    difference_seconds = total_seconds - _REFERENCE_LEGACY_CAP_SECONDS
+    reference_utilization = (
+        total_seconds / _REFERENCE_LEGACY_CAP_SECONDS * 100.0
+        if _REFERENCE_LEGACY_CAP_SECONDS
+        else None
+    )
+
+    by_camera = {
+        camera: {
+            "clips_with_duration": by_camera_clips[camera],
+            "total_seconds": round(duration_ms / 1000.0, 3),
+        }
+        for camera, duration_ms in sorted(by_camera_ms.items())
+    }
+
+    return {
+        "media_records": media_count,
+        "video_records": video_count,
+        "clips_with_duration": measured_count,
+        "clips_without_duration": media_count - measured_count,
+        "coverage_percent": round(measured_count / media_count * 100.0, 2)
+        if media_count
+        else 0.0,
+        "total_duration_ms": round(total_ms, 3),
+        "total_duration_seconds": round(total_seconds, 3),
+        "total_duration_minutes": round(total_seconds / 60.0, 3),
+        "average_duration_seconds": round(
+            total_seconds / measured_count, 3
+        )
+        if measured_count
+        else None,
+        "minimum_duration_seconds": round(min(durations_ms) / 1000.0, 3)
+        if durations_ms
+        else None,
+        "maximum_duration_seconds": round(max(durations_ms) / 1000.0, 3)
+        if durations_ms
+        else None,
+        "by_camera": by_camera,
+        "reference_legacy_cap_seconds": _REFERENCE_LEGACY_CAP_SECONDS,
+        "difference_from_7200_seconds": round(difference_seconds, 3),
+        "reference_7200_utilization_percent": round(reference_utilization, 2)
+        if reference_utilization is not None
+        else None,
+        "reference_note": (
+            "7,200 seconds is shown only as a comparison target for the known "
+            "legacy Blink cloud allocation; this diagnostic does not assume "
+            "that it is the active quota for this account."
+        ),
+    }
+
+
+def _next_pagination_key(
+    payload: dict[str, Any], media: list[Any]
+) -> tuple[int | None, str | None]:
     """Resolve Blink's next media cursor, preferring any explicit server field."""
     for key in (
         "pagination_key",
@@ -58,9 +177,9 @@ def _next_pagination_key(payload: dict[str, Any], media: list[Any]) -> tuple[int
         if cursor is not None:
             return cursor, f"response.{key}"
 
-    # The Android API accepts a Long pagination_key but its MediaResponse model
-    # has no dedicated next-key field. Media ids are numeric and ordered, so the
-    # final item id is the practical continuation cursor used here.
+    # The Android API accepts a Long pagination_key but response variants do
+    # not always expose a continuation field. Media ids are numeric and ordered,
+    # so the final item id is the practical fallback continuation cursor.
     for item in reversed(media):
         if isinstance(item, dict):
             cursor = _numeric_cursor(item.get("id"))
@@ -130,7 +249,12 @@ async def _fetch_all_media_pages(
             all_media.append(item)
             added_count += 1
 
-        server_limit = _numeric_cursor(payload.get("limit"))
+        # Current Blink responses use page_size=200. Keep support for older
+        # response variants that used limit.
+        server_limit = _numeric_cursor(payload.get("page_size"))
+        if server_limit is None:
+            server_limit = _numeric_cursor(payload.get("limit"))
+
         next_key, cursor_source = _next_pagination_key(payload, page_media)
 
         page_summaries.append(
@@ -151,8 +275,6 @@ async def _fetch_all_media_pages(
             stop_reason = "empty_page"
             break
 
-        # If Blink reports a page size and this page is shorter, we've reached
-        # the end of the requested time window.
         if server_limit and len(page_media) < server_limit:
             stop_reason = "short_page"
             break
@@ -175,11 +297,10 @@ async def _fetch_all_media_pages(
         page_limit_reached = True
         stop_reason = "page_safety_cap"
 
-    # Preserve normal response metadata for the existing summary/UI, but add a
-    # dedicated pagination block and the final page's server metadata.
     combined: dict[str, Any] = dict(first_metadata)
     combined.update(last_metadata)
     combined["media"] = all_media
+    combined["duration_summary"] = _build_duration_summary(all_media)
     combined["pagination"] = {
         "pages_fetched": len(page_summaries),
         "unique_media_count": len(all_media),
@@ -192,7 +313,9 @@ async def _fetch_all_media_pages(
     return combined, None
 
 
-async def _collect_paginated_cloud_media_diagnostics(blink, hours: int) -> dict[str, Any]:
+async def _collect_paginated_cloud_media_diagnostics(
+    blink, hours: int
+) -> dict[str, Any]:
     auth = getattr(blink, "auth", None)
     urls = getattr(blink, "urls", None)
     base_url = getattr(urls, "base_url", None)
@@ -240,6 +363,14 @@ async def _collect_paginated_cloud_media_diagnostics(blink, hours: int) -> dict[
     unwatched_safe = cloud_diag._sanitize(unwatched)
     media_summary = cloud_diag._summarize_media_response(media)
 
+    # duration_summary is intentionally duplicated at the top media_list level
+    # for easy consumption, while remaining in response_metadata for backwards
+    # compatibility with the existing Settings UI.
+    if isinstance(media, dict) and isinstance(media.get("duration_summary"), dict):
+        media_summary["duration_summary"] = cloud_diag._sanitize(
+            media["duration_summary"]
+        )
+
     homescreen = getattr(blink, "homescreen", {}) or {}
     video_stats = (
         cloud_diag._sanitize(homescreen.get("video_stats", {}))
@@ -268,10 +399,12 @@ async def _collect_paginated_cloud_media_diagnostics(blink, hours: int) -> dict[
         "errors": errors,
         "notes": [
             "The media-list POST is a read-only retrieval call in Blink's current API.",
-            "Media diagnostics now paginate until Blink returns a short/empty page, no progress is made, or the 50-page safety cap is reached.",
+            "Media diagnostics paginate until Blink returns a partial/empty page, no progress is made, or the 50-page safety cap is reached.",
+            "Current page_size responses are honored, avoiding an unnecessary extra request after a partial final page.",
             "When Blink does not return an explicit continuation field, the final media id from the current page is used as pagination_key.",
             "Media ids are deduplicated across pages so a repeated cursor cannot inflate counts.",
-            "purge_id and limit remain server-provided fields and are shown without assuming undocumented semantics.",
+            "Clip duration is read from metadata.pts_length_ms when present; raw metadata is not exposed in the diagnostic response.",
+            "The 7,200-second comparison is diagnostic only and does not assert that this account is using the legacy quota.",
             "A deleted_count above zero means Blink explicitly returned clip records marked deleted in this diagnostic window.",
         ],
     }
