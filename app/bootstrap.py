@@ -7,6 +7,7 @@ from http_debug_bootstrap import apply_http_debug_tracing
 from notification_snooze_fix import apply_notification_snooze_fix
 from notification_snooze_ui import apply_notification_snooze_ui
 from rate_limit_body_fix import apply_rate_limit_body_fix
+from schedule_templates_ui import apply_schedule_templates_ui
 from scheduling_guards import apply_scheduling_guards
 from web_rate_limit_ui import apply_web_rate_limit_ui
 
@@ -19,6 +20,7 @@ apply_notification_snooze_fix()
 apply_web_rate_limit_ui()
 apply_configure_passthrough_fix()
 apply_notification_snooze_ui()
+apply_schedule_templates_ui()
 
 
 if __name__ == "__main__":
